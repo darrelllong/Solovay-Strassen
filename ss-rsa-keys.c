@@ -4,8 +4,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-// Generate a 64-bit uniform random variat using the admittedly poor UNIX pseudorandom
-// number generator.
+// Generate a 64-bit uniform random variate using the admittedly poor UNIX pseudorandom
+// number generator. Do not use this for production cryptography.
 
 static inline uint64_t uniform(void) {
     return
@@ -19,6 +19,9 @@ static inline uint64_t uniform(void) {
 bool is_even(int64_t n) { return (n & 0x1) == 0; }
 
 bool is_odd(int64_t n) { return (n & 0x1) == 1; }
+
+//          d
+// Compute a  (mod n) using the method of repeated squaring.
 
 int64_t power_mod(int64_t a, int64_t d, int64_t n) {
   int64_t v = 1;
@@ -54,6 +57,8 @@ int64_t Jacobi(int64_t n, int64_t k) {
   return (k == 1) ? t : 0;
 }
 
+// The Solovay-Strassen primality test.
+
 bool is_prime(int64_t n, int64_t k) {
   if (n < 2 || (n != 2 && n % 2 == 0)) {
     return false;
@@ -71,13 +76,20 @@ bool is_prime(int64_t n, int64_t k) {
   return true;
 }
 
+#define CONFIDENCE 50
+
+// Find a random prime number of b bits. We repeat the test CONFIDENCE times (for 64 bits
+// 50 is more than sufficient).
+
 int64_t random_prime(int64_t b) {
   uint64_t r;
   do {
     r = uniform() & ((1 << b) - 1);
-  } while (!is_prime(r, 50));
+  } while (!is_prime(r, CONFIDENCE));
   return r;
 }
+
+// Compute the GCD (Greatest Common Divisor) using the Euclidean algorithm.
 
 int64_t gcd(int64_t a, int64_t b) {
   while (b != 0) {
@@ -88,7 +100,11 @@ int64_t gcd(int64_t a, int64_t b) {
   return a;
 }
 
+// LCM (Least Common Multiple)
+
 int64_t lcm(int64_t a, int64_t b) { return llabs(a * b) / gcd(a, b); }
+
+// Compute the multiplicative inverse of a (mod n) using the Extended Euclidean algorithm.
 
 int64_t inverse(int64_t a, int64_t n) {
   int64_t r = n, rP = a;
@@ -113,8 +129,8 @@ int main(void) {
 
   srandom(getpid());
 
-  int64_t p = random_prime(24); // Random prime
-  int64_t q = random_prime(24); // Random prime
+  int64_t p = random_prime(24); // 24-bit Random prime
+  int64_t q = random_prime(24); // 24-bit Random prime
   int64_t n = p * q;
   printf("Random RSA keys\n");
   printf("p = %" PRId64 ", q = %" PRId64 ", n = %" PRId64 "\n\n", p, q, n);
