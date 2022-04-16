@@ -11,8 +11,8 @@ static inline uint64_t uniform(void) {
     return
     (((uint64_t)random() & 0x01) << 63) |
     (((uint64_t)random() & 0x01) << 31) |
-    ((uint64_t)random() << 32) |
-    (uint64_t)random();
+     ((uint64_t)random() << 32) |
+      (uint64_t)random();
 
 }
 
@@ -63,7 +63,7 @@ bool is_prime(int64_t n, int64_t k) {
   if (n < 2 || (n != 2 && n % 2 == 0)) {
     return false;
   }
-  if (n == 3) {
+  if (n == 2 || n == 3) {
     return true;
   }
   for (int i = 0; i < k; i += 1) {
