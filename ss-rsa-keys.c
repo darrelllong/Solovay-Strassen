@@ -2,7 +2,6 @@
 
 #include <errno.h>
 #include <inttypes.h>
-#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +19,9 @@ enum {
   MAX_BITS = 31
 };
 
+static_assert(MAX_BITS * 2 < 63,
+              "RSA arithmetic must fit in a signed 64-bit integer");
+
 typedef struct {
   uint64_t state;
 } rng_t;
@@ -36,9 +38,10 @@ typedef struct {
   uint64_t d_lambda;
 } rsa_keys_t;
 
+/* Keep benchmark work observable to the optimizer. */
 static volatile uint64_t benchmark_sink;
 
-/* SplitMix64 is a fast demonstration RNG, not a cryptographic RNG. */
+/* SplitMix64 is reproducible, but not suitable for cryptography. */
 static uint64_t rng_next(rng_t *rng) {
   uint64_t z = (rng->state += UINT64_C(0x9e3779b97f4a7c15));
   z = (z ^ (z >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
@@ -49,7 +52,7 @@ static uint64_t rng_next(rng_t *rng) {
 static void rng_seed_from_system(rng_t *rng) {
   uint64_t seed = 0;
   if (getentropy(&seed, sizeof(seed)) != 0) {
-    struct timespec now = {0, 0};
+    struct timespec now = {};
     (void)timespec_get(&now, TIME_UTC);
     seed = ((uint64_t)now.tv_sec << 32) ^ (uint64_t)now.tv_nsec ^
            (uint64_t)getpid();
@@ -57,7 +60,7 @@ static void rng_seed_from_system(rng_t *rng) {
   rng->state = seed;
 }
 
-/* Return a uniform value in [0, bound), without modulo bias. */
+/* Rejection sampling avoids modulo bias. */
 static uint64_t rng_below(rng_t *rng, uint64_t bound) {
   const uint64_t threshold = (uint64_t)(-bound) % bound;
   uint64_t value;
@@ -72,7 +75,7 @@ static uint64_t add_mod(uint64_t a, uint64_t b, uint64_t modulus) {
   return a >= modulus - b ? a - (modulus - b) : a + b;
 }
 
-/* Multiply modulo modulus without relying on overflowing integer arithmetic. */
+/* Double-and-add avoids overflowing a * b. */
 static uint64_t multiply_mod(uint64_t a, uint64_t b, uint64_t modulus) {
   uint64_t result = 0;
 
@@ -127,9 +130,9 @@ static int jacobi_symbol(uint64_t numerator, uint64_t denominator) {
       }
     }
 
-    const uint64_t temporary = numerator;
+    const uint64_t swap = numerator;
     numerator = denominator;
-    denominator = temporary;
+    denominator = swap;
     if ((numerator & 3U) == 3 && (denominator & 3U) == 3) {
       sign = -sign;
     }
@@ -146,7 +149,7 @@ static bool is_probable_prime(uint64_t candidate, uint32_t rounds,
   if (candidate < 2) {
     return false;
   }
-  for (size_t i = 0; i < sizeof(small_primes) / sizeof(small_primes[0]); ++i) {
+  for (size_t i = 0; i < sizeof small_primes / sizeof *small_primes; ++i) {
     if (candidate == small_primes[i]) {
       return true;
     }
@@ -229,17 +232,17 @@ static uint64_t public_exponent(uint64_t modulus) {
 }
 
 static double monotonic_seconds(void) {
-  struct timespec now = {0, 0};
+  struct timespec now = {};
 
   if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
     perror("clock_gettime");
     exit(EXIT_FAILURE);
   }
-  return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
+  return (double)now.tv_sec + (double)now.tv_nsec / 1'000'000'000.0;
 }
 
 static rsa_keys_t generate_keys(uint32_t bits, uint32_t rounds, rng_t *rng) {
-  rsa_keys_t keys;
+  rsa_keys_t keys = {};
 
   keys.p = random_prime(bits, rounds, rng);
   do {
@@ -257,7 +260,7 @@ static rsa_keys_t generate_keys(uint32_t bits, uint32_t rounds, rng_t *rng) {
 }
 
 static bool parse_u64(const char *text, uint64_t *value) {
-  char *end = NULL;
+  char *end = nullptr;
 
   if (text[0] == '-') {
     return false;

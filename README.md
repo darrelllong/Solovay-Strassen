@@ -1,6 +1,6 @@
 # Solovay–Strassen
 
-This is a small C17 demonstration of the Solovay–Strassen probabilistic
+This is a small C23 demonstration of the Solovay–Strassen probabilistic
 primality test. It generates two distinct primes, constructs a toy RSA
 modulus, and shows the private exponents obtained with both Euler's totient
 `phi(n)` and Carmichael's function `lambda(n)`.
@@ -36,7 +36,7 @@ The program:
 - guarantees that `p` and `q` are different;
 - seeds its SplitMix64 generator from the operating system, while `--seed`
   permits repeatable tests and benchmarks; and
-- builds with strict C17 warnings enabled.
+- builds with strict C23 warnings enabled.
 
 This is an educational example, **not a cryptographic key generator**.
 SplitMix64 is not a cryptographically secure random-number generator, the

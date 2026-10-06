@@ -1,6 +1,6 @@
 CC ?= cc
 CFLAGS ?= -O3
-CFLAGS += -std=c17 -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+CFLAGS += -std=c23 -Wall -Wextra -Wpedantic -Wconversion -Wshadow
 CPPFLAGS ?=
 LDFLAGS ?=
 
