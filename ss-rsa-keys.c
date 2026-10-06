@@ -128,7 +128,18 @@ static uint64_t power_mod(uint64_t base, uint64_t exponent,
   return result;
 }
 
-/* Apply quadratic reciprocity until the Jacobi symbol is determined. */
+/*
+ * The Jacobi symbol (a/n) extends the Legendre symbol from odd primes to any
+ * positive odd n. If n = p1 ... pk is its prime factorization, with repeated
+ * factors included, then
+ *
+ *                 (a/n) = (a/p1) ... (a/pk).
+ *
+ * For a prime p, (a/p) is zero when p divides a, +1 when some x satisfies
+ * x^2 ≡ a (mod p), and -1 otherwise. The loop uses quadratic reciprocity to
+ * compute the product without factoring n. Solovay–Strassen compares it with
+ * a^((n - 1)/2) mod n.
+ */
 static int jacobi_symbol(uint64_t numerator, uint64_t denominator) {
   int sign = 1;
 
