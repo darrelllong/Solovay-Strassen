@@ -1,165 +1,419 @@
+#define _DEFAULT_SOURCE
+
+#include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#if defined(__APPLE__)
+#include <sys/random.h>
+#endif
+#include <time.h>
 #include <unistd.h>
 
-// Generate a 64-bit uniform random variate using the admittedly poor UNIX pseudorandom
-// number generator. Do not use this for production cryptography.
+enum {
+  DEFAULT_BITS = 24,
+  DEFAULT_ROUNDS = 50,
+  MIN_BITS = 10,
+  MAX_BITS = 31
+};
 
-static inline uint64_t uniform(void) {
-    return
-    (((uint64_t)random() & 0x01) << 63) |
-    (((uint64_t)random() & 0x01) << 31) |
-     ((uint64_t)random() << 32) |
-      (uint64_t)random();
+typedef struct {
+  uint64_t state;
+} rng_t;
 
+typedef struct {
+  uint64_t p;
+  uint64_t q;
+  uint64_t n;
+  uint64_t phi;
+  uint64_t lambda;
+  uint64_t e_phi;
+  uint64_t d_phi;
+  uint64_t e_lambda;
+  uint64_t d_lambda;
+} rsa_keys_t;
+
+static volatile uint64_t benchmark_sink;
+
+/* SplitMix64 is a fast demonstration RNG, not a cryptographic RNG. */
+static uint64_t rng_next(rng_t *rng) {
+  uint64_t z = (rng->state += UINT64_C(0x9e3779b97f4a7c15));
+  z = (z ^ (z >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+  z = (z ^ (z >> 27)) * UINT64_C(0x94d049bb133111eb);
+  return z ^ (z >> 31);
 }
 
-bool is_even(int64_t n) { return (n & 0x1) == 0; }
-
-bool is_odd(int64_t n) { return (n & 0x1) == 1; }
-
-//          d
-// Compute a  (mod n) using the method of repeated squaring.
-
-int64_t power_mod(int64_t a, int64_t d, int64_t n) {
-  int64_t v = 1;
-  for (int64_t p = a; d > 0; d >>= 1) {
-    if (is_odd(d)) {
-      v = (v * p) % n;
-    }
-    p = (p * p) % n;
+static void rng_seed_from_system(rng_t *rng) {
+  uint64_t seed = 0;
+  if (getentropy(&seed, sizeof(seed)) != 0) {
+    struct timespec now = {0, 0};
+    (void)timespec_get(&now, TIME_UTC);
+    seed = ((uint64_t)now.tv_sec << 32) ^ (uint64_t)now.tv_nsec ^
+           (uint64_t)getpid();
   }
-  return v;
+  rng->state = seed;
 }
 
-// Compute the Jacobi symbol:
-//   n    ⎡  0 if n ≡ 0 (mod k)
-//  (-) = ⎢  1 if n ≢ 0 (mod k) ⋀ (∃x) a ≡ x**2 (mod k)
-//   k    ⎣ -1 if n ≢ 0 (mod k) ⋀ (∄x) a ≡ x**2 (mod k)
+/* Return a uniform value in [0, bound), without modulo bias. */
+static uint64_t rng_below(rng_t *rng, uint64_t bound) {
+  const uint64_t threshold = (uint64_t)(-bound) % bound;
+  uint64_t value;
 
-int64_t Jacobi(int64_t n, int64_t k) {
-  n = n % k;
-  int64_t t = 1;
-  while (n != 0) {
-    while (is_even(n)) {
-      n = n / 2;
-      int64_t r = k % 8;
-      t = (r == 3 || r == 5) ? -t : t;
-    }
-    int64_t tmp = k;
-    k = n;
-    n = tmp;
-    t = (n % 4 == 3 && k % 4 == 3) ? -t : t;
-    n = n % k;
+  do {
+    value = rng_next(rng);
+  } while (value < threshold);
+  return value % bound;
+}
+
+static uint64_t add_mod(uint64_t a, uint64_t b, uint64_t modulus) {
+  return a >= modulus - b ? a - (modulus - b) : a + b;
+}
+
+/* Multiply modulo modulus without relying on overflowing integer arithmetic. */
+static uint64_t multiply_mod(uint64_t a, uint64_t b, uint64_t modulus) {
+  uint64_t result = 0;
+
+  a %= modulus;
+  b %= modulus;
+  if (a == 0 || b <= UINT64_MAX / a) {
+    return (a * b) % modulus;
   }
-  return (k == 1) ? t : 0;
+
+  while (b != 0) {
+    if ((b & 1U) != 0) {
+      result = add_mod(result, a, modulus);
+    }
+    b >>= 1;
+    if (b != 0) {
+      a = add_mod(a, a, modulus);
+    }
+  }
+  return result;
 }
 
-// The Solovay-Strassen primality test.
+static uint64_t power_mod(uint64_t base, uint64_t exponent,
+                          uint64_t modulus) {
+  uint64_t result = 1 % modulus;
 
-bool is_prime(int64_t n, int64_t k) {
-  if (n < 2 || (n != 2 && n % 2 == 0)) {
+  base %= modulus;
+  while (exponent != 0) {
+    if ((exponent & 1U) != 0) {
+      result = multiply_mod(result, base, modulus);
+    }
+    exponent >>= 1;
+    if (exponent != 0) {
+      base = multiply_mod(base, base, modulus);
+    }
+  }
+  return result;
+}
+
+static int jacobi_symbol(uint64_t numerator, uint64_t denominator) {
+  int sign = 1;
+
+  if (denominator == 0 || (denominator & 1U) == 0) {
+    return 0;
+  }
+  numerator %= denominator;
+  while (numerator != 0) {
+    while ((numerator & 1U) == 0) {
+      numerator >>= 1;
+      const uint64_t residue = denominator & 7U;
+      if (residue == 3 || residue == 5) {
+        sign = -sign;
+      }
+    }
+
+    const uint64_t temporary = numerator;
+    numerator = denominator;
+    denominator = temporary;
+    if ((numerator & 3U) == 3 && (denominator & 3U) == 3) {
+      sign = -sign;
+    }
+    numerator %= denominator;
+  }
+  return denominator == 1 ? sign : 0;
+}
+
+static bool is_probable_prime(uint64_t candidate, uint32_t rounds,
+                              rng_t *rng) {
+  static const uint32_t small_primes[] = {
+      2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37};
+
+  if (candidate < 2) {
     return false;
   }
-  if (n == 2 || n == 3) {
-    return true;
+  for (size_t i = 0; i < sizeof(small_primes) / sizeof(small_primes[0]); ++i) {
+    if (candidate == small_primes[i]) {
+      return true;
+    }
+    if (candidate % small_primes[i] == 0) {
+      return false;
+    }
   }
-  for (int i = 0; i < k; i += 1) {
-    uint64_t a = (uniform() % (n - 2)) + 2; // a ∊ [2, ..., n - 1]
-    int64_t x = Jacobi(a, n);
-    if (x == 0 || (power_mod(a, (n - 1) / 2, n) != (x + n) % n)) {
+
+  for (uint32_t i = 0; i < rounds; ++i) {
+    const uint64_t witness = 2 + rng_below(rng, candidate - 3);
+    const int jacobi = jacobi_symbol(witness, candidate);
+    const uint64_t expected = jacobi < 0 ? candidate - 1 : (uint64_t)jacobi;
+
+    if (jacobi == 0 ||
+        power_mod(witness, (candidate - 1) / 2, candidate) != expected) {
       return false;
     }
   }
   return true;
 }
 
-#define CONFIDENCE 50
+static uint64_t random_prime(uint32_t bits, uint32_t rounds, rng_t *rng) {
+  const uint64_t mask = (UINT64_C(1) << bits) - 1;
+  const uint64_t high_bit = UINT64_C(1) << (bits - 1);
 
-// Find a random prime number of b bits. We repeat the test CONFIDENCE times (for 64 bits
-// 50 is more than sufficient).
-
-int64_t random_prime(int64_t b) {
-  uint64_t r;
-  do {
-    r = uniform() & ((1 << b) - 1);
-  } while (!is_prime(r, CONFIDENCE));
-  return r;
+  for (;;) {
+    const uint64_t candidate = (rng_next(rng) & mask) | high_bit | 1U;
+    if (is_probable_prime(candidate, rounds, rng)) {
+      return candidate;
+    }
+  }
 }
 
-// Compute the GCD (Greatest Common Divisor) using the Euclidean algorithm.
-
-int64_t gcd(int64_t a, int64_t b) {
+static uint64_t greatest_common_divisor(uint64_t a, uint64_t b) {
   while (b != 0) {
-    int64_t t = a;
+    const uint64_t remainder = a % b;
     a = b;
-    b = t % b;
+    b = remainder;
   }
   return a;
 }
 
-// LCM (Least Common Multiple)
-
-int64_t lcm(int64_t a, int64_t b) { return llabs(a * b) / gcd(a, b); }
-
-// Compute the multiplicative inverse of a (mod n) using the Extended Euclidean algorithm.
-
-int64_t inverse(int64_t a, int64_t n) {
-  int64_t r = n, rP = a;
-  int64_t t = 0, tP = 1;
-  while (rP != 0) {
-    int64_t q = r / rP;
-    int64_t tmp = rP;
-    rP = r - q * rP;
-    r = tmp;
-    tmp = tP;
-    tP = t - q * tP;
-    t = tmp;
-  }
-  if (r > 1) {
-    return 0;
-  } else {
-    return t < 0 ? t + n : t;
-  }
+static uint64_t least_common_multiple(uint64_t a, uint64_t b) {
+  return (a / greatest_common_divisor(a, b)) * b;
 }
 
-int main(void) {
+static uint64_t modular_inverse(uint64_t value, uint64_t modulus) {
+  int64_t old_coefficient = 0;
+  int64_t coefficient = 1;
+  int64_t old_remainder = (int64_t)modulus;
+  int64_t remainder = (int64_t)(value % modulus);
 
-  srandom(getpid());
+  while (remainder != 0) {
+    const int64_t quotient = old_remainder / remainder;
+    const int64_t next_remainder = old_remainder - quotient * remainder;
+    const int64_t next_coefficient =
+        old_coefficient - quotient * coefficient;
 
-  int64_t p = random_prime(24); // 24-bit Random prime
-  int64_t q = random_prime(24); // 24-bit Random prime
-  int64_t n = p * q;
-  printf("Random RSA keys\n");
-  printf("p = %" PRId64 ", q = %" PRId64 ", n = %" PRId64 "\n\n", p, q, n);
-
-  int64_t totient = (p - 1) * (q - 1); // Euler's 𝜑
-  printf("𝜑 = %" PRId64, totient);
-  int64_t e = (1 << 16) + 1; // Canonical e
-  while (gcd(e, totient) != 1) {
-    e += 2;
+    old_remainder = remainder;
+    remainder = next_remainder;
+    old_coefficient = coefficient;
+    coefficient = next_coefficient;
   }
-  printf(", e = %" PRId64, e);
-
-  int64_t d = inverse(e, totient);
-  printf(", d = %" PRId64 "\n", d);
-  printf("%" PRId64 " * %" PRId64 " = %" PRId64 " (mod %" PRId64 ")\n", e, d, (e * d) % totient, totient);
-
-  int64_t lambda = lcm(p - 1, q - 1); // Carmichael's 𝛌
-  printf("\n𝛌 = %" PRId64, lambda);
-  e = (1 << 16) + 1; // Canonical e
-  while (gcd(e, lambda) != 1) {
-    e += 2;
+  if (old_remainder != 1) {
+    return 0;
   }
-  printf(", e = %" PRId64, e);
+  if (old_coefficient < 0) {
+    old_coefficient += (int64_t)modulus;
+  }
+  return (uint64_t)old_coefficient;
+}
 
-  d = inverse(e, lambda);
-  printf(", d = %" PRId64 "\n", d);
-  printf("%" PRId64 " * %" PRId64 " = %" PRId64 " (mod %" PRId64 ")\n", e, d, (e * d) % lambda, lambda);
+static uint64_t public_exponent(uint64_t modulus) {
+  uint64_t exponent = 65537;
 
-  printf("\n𝜑/𝛌 = %" PRId64 "/%" PRId64 " = %" PRId64 "\n", totient, lambda, totient/lambda);
+  while (greatest_common_divisor(exponent, modulus) != 1) {
+    exponent += 2;
+  }
+  return exponent;
+}
 
-  return 0;
+static double monotonic_seconds(void) {
+  struct timespec now = {0, 0};
+
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+    perror("clock_gettime");
+    exit(EXIT_FAILURE);
+  }
+  return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
+}
+
+static rsa_keys_t generate_keys(uint32_t bits, uint32_t rounds, rng_t *rng) {
+  rsa_keys_t keys;
+
+  keys.p = random_prime(bits, rounds, rng);
+  do {
+    keys.q = random_prime(bits, rounds, rng);
+  } while (keys.q == keys.p);
+
+  keys.n = keys.p * keys.q;
+  keys.phi = (keys.p - 1) * (keys.q - 1);
+  keys.lambda = least_common_multiple(keys.p - 1, keys.q - 1);
+  keys.e_phi = public_exponent(keys.phi);
+  keys.d_phi = modular_inverse(keys.e_phi, keys.phi);
+  keys.e_lambda = public_exponent(keys.lambda);
+  keys.d_lambda = modular_inverse(keys.e_lambda, keys.lambda);
+  return keys;
+}
+
+static bool parse_u64(const char *text, uint64_t *value) {
+  char *end = NULL;
+
+  if (text[0] == '-') {
+    return false;
+  }
+  errno = 0;
+  const uintmax_t parsed = strtoumax(text, &end, 0);
+  if (errno != 0 || end == text || *end != '\0' || parsed > UINT64_MAX) {
+    return false;
+  }
+  *value = (uint64_t)parsed;
+  return true;
+}
+
+static void print_usage(const char *program) {
+  printf("Usage: %s [--bits N] [--rounds N] [--seed N]\n", program);
+  printf("       %s [options] --benchmark COUNT\n", program);
+  printf("       %s --self-test\n", program);
+  printf("\nDefaults: %d-bit primes and %d Solovay-Strassen rounds.\n",
+         DEFAULT_BITS, DEFAULT_ROUNDS);
+}
+
+static bool run_self_tests(void) {
+  rng_t rng = {UINT64_C(0x4d595df4d0f33173)};
+  bool ok = true;
+
+#define CHECK(expression)                                                       \
+  do {                                                                          \
+    if (!(expression)) {                                                        \
+      fprintf(stderr, "self-test failed at line %d: %s\n", __LINE__,           \
+              #expression);                                                     \
+      ok = false;                                                               \
+    }                                                                           \
+  } while (false)
+
+  CHECK(power_mod(4, 13, 497) == 445);
+  CHECK(jacobi_symbol(1001, 9907) == -1);
+  CHECK(jacobi_symbol(3, 15) == 0);
+  CHECK(greatest_common_divisor(48, 18) == 6);
+  CHECK(least_common_multiple(21, 6) == 42);
+  CHECK(modular_inverse(17, 3120) == 2753);
+  CHECK(is_probable_prime(41, 20, &rng));
+  CHECK(is_probable_prime(65537, 20, &rng));
+  CHECK(!is_probable_prime(1, 20, &rng));
+  CHECK(!is_probable_prime(25, 20, &rng));
+  CHECK(!is_probable_prime(561, 20, &rng));
+
+  const rsa_keys_t keys = generate_keys(16, 20, &rng);
+  CHECK(keys.p != keys.q);
+  CHECK(keys.p >= (UINT64_C(1) << 15));
+  CHECK(keys.q >= (UINT64_C(1) << 15));
+  CHECK(multiply_mod(keys.e_phi, keys.d_phi, keys.phi) == 1);
+  CHECK(multiply_mod(keys.e_lambda, keys.d_lambda, keys.lambda) == 1);
+  CHECK(power_mod(power_mod(42, keys.e_lambda, keys.n), keys.d_lambda,
+                  keys.n) == 42);
+
+#undef CHECK
+
+  if (ok) {
+    puts("all self-tests passed");
+  }
+  return ok;
+}
+
+int main(int argc, char **argv) {
+  uint32_t bits = DEFAULT_BITS;
+  uint32_t rounds = DEFAULT_ROUNDS;
+  uint64_t benchmark_count = 0;
+  uint64_t seed = 0;
+  bool seed_supplied = false;
+  bool self_test = false;
+
+  for (int i = 1; i < argc; ++i) {
+    uint64_t parsed;
+
+    if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+      print_usage(argv[0]);
+      return EXIT_SUCCESS;
+    }
+    if (strcmp(argv[i], "--self-test") == 0) {
+      self_test = true;
+      continue;
+    }
+    if ((strcmp(argv[i], "--bits") == 0 ||
+         strcmp(argv[i], "--rounds") == 0 ||
+         strcmp(argv[i], "--seed") == 0 ||
+         strcmp(argv[i], "--benchmark") == 0) &&
+        i + 1 < argc && parse_u64(argv[i + 1], &parsed)) {
+      if (strcmp(argv[i], "--bits") == 0) {
+        if (parsed < MIN_BITS || parsed > MAX_BITS) {
+          fprintf(stderr, "--bits must be between %d and %d\n", MIN_BITS,
+                  MAX_BITS);
+          return EXIT_FAILURE;
+        }
+        bits = (uint32_t)parsed;
+      } else if (strcmp(argv[i], "--rounds") == 0) {
+        if (parsed == 0 || parsed > UINT32_MAX) {
+          fputs("--rounds must be between 1 and 4294967295\n", stderr);
+          return EXIT_FAILURE;
+        }
+        rounds = (uint32_t)parsed;
+      } else if (strcmp(argv[i], "--seed") == 0) {
+        seed = parsed;
+        seed_supplied = true;
+      } else {
+        if (parsed == 0) {
+          fputs("--benchmark must be greater than zero\n", stderr);
+          return EXIT_FAILURE;
+        }
+        benchmark_count = parsed;
+      }
+      ++i;
+      continue;
+    }
+    fprintf(stderr, "invalid or incomplete option: %s\n", argv[i]);
+    print_usage(argv[0]);
+    return EXIT_FAILURE;
+  }
+
+  if (self_test) {
+    return run_self_tests() ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+
+  rng_t rng;
+  if (seed_supplied) {
+    rng.state = seed;
+  } else {
+    rng_seed_from_system(&rng);
+  }
+
+  if (benchmark_count != 0) {
+    uint64_t checksum = 0;
+    const double start = monotonic_seconds();
+    for (uint64_t i = 0; i < benchmark_count; ++i) {
+      const rsa_keys_t keys = generate_keys(bits, rounds, &rng);
+      checksum ^= keys.n ^ keys.d_lambda;
+    }
+    const double elapsed = monotonic_seconds() - start;
+    benchmark_sink = checksum;
+    printf("%.9f,%.3f\n", elapsed, (double)benchmark_count / elapsed);
+    return EXIT_SUCCESS;
+  }
+
+  const rsa_keys_t keys = generate_keys(bits, rounds, &rng);
+  puts("Random RSA key demonstration");
+  printf("p = %" PRIu64 ", q = %" PRIu64 ", n = %" PRIu64 "\n\n",
+         keys.p, keys.q, keys.n);
+  printf("phi = %" PRIu64 ", e = %" PRIu64 ", d = %" PRIu64 "\n",
+         keys.phi, keys.e_phi, keys.d_phi);
+  printf("e * d mod phi = %" PRIu64 "\n\n",
+         multiply_mod(keys.e_phi, keys.d_phi, keys.phi));
+  printf("lambda = %" PRIu64 ", e = %" PRIu64 ", d = %" PRIu64 "\n",
+         keys.lambda, keys.e_lambda, keys.d_lambda);
+  printf("e * d mod lambda = %" PRIu64 "\n\n",
+         multiply_mod(keys.e_lambda, keys.d_lambda, keys.lambda));
+  printf("phi / lambda = %" PRIu64 " / %" PRIu64 " = %" PRIu64 "\n",
+         keys.phi, keys.lambda, keys.phi / keys.lambda);
+  puts("\nEducational example only; these small keys and this RNG are not secure.");
+  return EXIT_SUCCESS;
 }
