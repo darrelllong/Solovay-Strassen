@@ -12,6 +12,12 @@
 #include <time.h>
 #include <unistd.h>
 
+/*
+ * This program uses Solovay–Strassen to find two small primes, builds a toy RSA
+ * modulus, and compares private exponents computed modulo Euler's phi(n) and
+ * Carmichael's lambda(n). It is a demonstration, not cryptographic software.
+ */
+
 enum {
   DEFAULT_BITS = 24,
   DEFAULT_ROUNDS = 50,
@@ -41,7 +47,7 @@ typedef struct {
 /* Keep benchmark work observable to the optimizer. */
 static volatile uint64_t benchmark_sink;
 
-/* SplitMix64 is reproducible, but not suitable for cryptography. */
+/* SplitMix64 makes tests repeatable; it must not generate real key material. */
 static uint64_t rng_next(rng_t *rng) {
   uint64_t z = (rng->state += UINT64_C(0x9e3779b97f4a7c15));
   z = (z ^ (z >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
@@ -52,6 +58,7 @@ static uint64_t rng_next(rng_t *rng) {
 static void rng_seed_from_system(rng_t *rng) {
   uint64_t seed = 0;
   if (getentropy(&seed, sizeof(seed)) != 0) {
+    /* A weak fallback is acceptable only because this is a demonstration. */
     struct timespec now = {};
     (void)timespec_get(&now, TIME_UTC);
     seed = ((uint64_t)now.tv_sec << 32) ^ (uint64_t)now.tv_nsec ^
@@ -60,7 +67,10 @@ static void rng_seed_from_system(rng_t *rng) {
   rng->state = seed;
 }
 
-/* Rejection sampling avoids modulo bias. */
+/*
+ * Discard the short interval at the bottom of uint64_t so every residue below
+ * bound has the same number of preimages.
+ */
 static uint64_t rng_below(rng_t *rng, uint64_t bound) {
   const uint64_t threshold = (uint64_t)(-bound) % bound;
   uint64_t value;
@@ -72,10 +82,14 @@ static uint64_t rng_below(rng_t *rng, uint64_t bound) {
 }
 
 static uint64_t add_mod(uint64_t a, uint64_t b, uint64_t modulus) {
+  /* The operands are reduced; subtracting avoids an overflowing sum. */
   return a >= modulus - b ? a - (modulus - b) : a + b;
 }
 
-/* Double-and-add avoids overflowing a * b. */
+/*
+ * Multiply directly when it fits. Otherwise, double and add reduced residues
+ * so no intermediate product can overflow.
+ */
 static uint64_t multiply_mod(uint64_t a, uint64_t b, uint64_t modulus) {
   uint64_t result = 0;
 
@@ -114,6 +128,7 @@ static uint64_t power_mod(uint64_t base, uint64_t exponent,
   return result;
 }
 
+/* Apply quadratic reciprocity until the Jacobi symbol is determined. */
 static int jacobi_symbol(uint64_t numerator, uint64_t denominator) {
   int sign = 1;
 
@@ -141,6 +156,7 @@ static int jacobi_symbol(uint64_t numerator, uint64_t denominator) {
   return denominator == 1 ? sign : 0;
 }
 
+/* A composite can fool at most half the bases in a Solovay–Strassen round. */
 static bool is_probable_prime(uint64_t candidate, uint32_t rounds,
                               rng_t *rng) {
   static const uint32_t small_primes[] = {
@@ -171,6 +187,7 @@ static bool is_probable_prime(uint64_t candidate, uint32_t rounds,
   return true;
 }
 
+/* Fix the end bits so candidates are odd and have the requested width. */
 static uint64_t random_prime(uint32_t bits, uint32_t rounds, rng_t *rng) {
   const uint64_t mask = (UINT64_C(1) << bits) - 1;
   const uint64_t high_bit = UINT64_C(1) << (bits - 1);
@@ -196,6 +213,7 @@ static uint64_t least_common_multiple(uint64_t a, uint64_t b) {
   return (a / greatest_common_divisor(a, b)) * b;
 }
 
+/* Return the inverse found by extended Euclid, or zero when none exists. */
 static uint64_t modular_inverse(uint64_t value, uint64_t modulus) {
   int64_t old_coefficient = 0;
   int64_t coefficient = 1;
@@ -222,6 +240,7 @@ static uint64_t modular_inverse(uint64_t value, uint64_t modulus) {
   return (uint64_t)old_coefficient;
 }
 
+/* Prefer the conventional exponent 65537; advance if it shares a factor. */
 static uint64_t public_exponent(uint64_t modulus) {
   uint64_t exponent = 65537;
 
@@ -241,6 +260,7 @@ static double monotonic_seconds(void) {
   return (double)now.tv_sec + (double)now.tv_nsec / 1'000'000'000.0;
 }
 
+/* Compute both forms of the private exponent for comparison. */
 static rsa_keys_t generate_keys(uint32_t bits, uint32_t rounds, rng_t *rng) {
   rsa_keys_t keys = {};
 
